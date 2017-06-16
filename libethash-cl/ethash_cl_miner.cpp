@@ -391,7 +391,7 @@ bool ethash_cl_miner::init(
 			sprintf(options, "-cl-nv-maxrregcount=%d", maxregs);// , computeCapability);
 		}
 		else {
-			sprintf(options, "%s", "");
+			sprintf(options, "%s", "-x spir");
 		}
 		// create context
 		m_context = cl::Context(vector<cl::Device>(&device, &device + 1));
