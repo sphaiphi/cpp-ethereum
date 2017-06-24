@@ -321,8 +321,9 @@ void ethash_cl_miner::listDevices()
 
 void ethash_cl_miner::finish()
 {
-	if (m_queue())
-		m_queue.finish();
+	for (int i = 0; i < c_queue;i++)
+		if (m_queue[i]())
+			m_queue[i].finish();
 }
 
 
@@ -395,7 +396,8 @@ bool ethash_cl_miner::init(
 		}
 		// create context
 		m_context = cl::Context(vector<cl::Device>(&device, &device + 1));
-		m_queue = cl::CommandQueue(m_context, device);
+		for (int i = 0; i < c_queue;i++)
+			m_queue[i] = cl::CommandQueue(m_context, device);
 
 		// make sure that global work size is evenly divisible by the local workgroup size
 		m_globalWorkSize = s_initialGlobalWorkSize;
@@ -446,7 +448,7 @@ bool ethash_cl_miner::init(
 			m_searchKernel = cl::Kernel(program, "ethash_search");
 			m_dagKernel = cl::Kernel(program, "ethash_calculate_dag_item");
 			ETHCL_LOG("Writing cache buffer");
-			m_queue.enqueueWriteBuffer(m_light, CL_TRUE, 0, _lightSize, _lightData);
+			m_queue[0].enqueueWriteBuffer(m_light, CL_TRUE, 0, _lightSize, _lightData);
 		}
 		catch (cl::Error const& err)
 		{
@@ -484,8 +486,8 @@ bool ethash_cl_miner::init(
 		for (uint32_t i = 0; i < fullRuns; i++)
 		{
 			m_dagKernel.setArg(0, i * m_globalWorkSize);
-			m_queue.enqueueNDRangeKernel(m_dagKernel, cl::NullRange, m_globalWorkSize, s_workgroupSize);
-			m_queue.finish();
+			m_queue[0].enqueueNDRangeKernel(m_dagKernel, cl::NullRange, m_globalWorkSize, s_workgroupSize);
+			m_queue[0].finish();
 			printf("OPENCL#%d: %.0f%%\n", _deviceId, 100.0f * (float)i / (float)fullRuns);
 		}
 
@@ -514,17 +516,19 @@ void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook
 		uint32_t const c_zero = 0;
 
 		// update header constant buffer
-		m_queue.enqueueWriteBuffer(m_header, false, 0, 32, header);
-		for (unsigned i = 0; i != c_bufferCount; ++i)
-			m_queue.enqueueWriteBuffer(m_searchBuffer[i], false, 0, 4, &c_zero);
+		/*m_queue[0].enqueueWriteBuffer(m_header, false, 0, 32, header);*/
+		for (unsigned i = 0; i != c_bufferCount; ++i) {
+			m_queue[i].enqueueWriteBuffer(m_header, CL_FALSE, 0, 32, header);
+			m_queue[i].enqueueWriteBuffer(m_searchBuffer[i], CL_FALSE, 0, 4, &c_zero);
 
 #if CL_VERSION_1_2 && 0
-		cl::Event pre_return_event;
-		if (!m_opencl_1_1)
-			m_queue.enqueueBarrierWithWaitList(NULL, &pre_return_event);
-		else
+			cl::Event pre_return_event;
+			if (!m_opencl_1_1)
+				m_queue[0].enqueueBarrierWithWaitList(NULL, &pre_return_event);
+			else
 #endif
-			m_queue.finish();
+			m_queue[i].finish();
+		}
 
 		// pass these to stop the compiler unrolling the loops
 		m_searchKernel.setArg(4, target);
@@ -532,17 +536,62 @@ void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook
 		unsigned buf = 0;
 		random_device engine;
 		uint64_t start_nonce;
+
+		std::vector<cl::Event> evt;
+		cl::Event q[c_queue];
 		if (_ethStratum) start_nonce = _startN;
 		else start_nonce = uniform_int_distribution<uint64_t>()(engine);
+
+		// supply output buffer to kernel
+		m_searchKernel.setArg(0, m_searchBuffer[buf]);
+		m_searchKernel.setArg(3, start_nonce);
+
+#define PLOG(x) {cout << x << endl;}
+		// execute it!
+		cl_int ret = m_queue[buf].enqueueNDRangeKernel(m_searchKernel, cl::NullRange, m_globalWorkSize, s_workgroupSize, &evt, &q[buf]);
+		if (ret != CL_SUCCESS) 
+		{
+			switch (ret)
+			{
+			case CL_INVALID_PROGRAM_EXECUTABLE:
+				PLOG("CL_INVALID_PROGRAM_EXECUTABLE");
+				break;
+			case CL_INVALID_COMMAND_QUEUE:
+				PLOG("CL_INVALID_COMMAND_QUEUE");
+				break;
+			case CL_INVALID_KERNEL:
+				PLOG("CL_INVALID_KERNEL");
+				break;
+			case CL_OUT_OF_RESOURCES:
+				PLOG("CL_OUT_OF_RESOURCES");
+				break;
+			case CL_MEM_OBJECT_ALLOCATION_FAILURE:
+				PLOG("CL_MEM_OBJECT_ALLOCATION_FAILURE");
+				break;
+			case CL_INVALID_EVENT_WAIT_LIST:
+				PLOG("CL_INVALID_EVENT_WAIT_LIST");
+				break;
+			default:
+				PLOG("Unknown error");
+				break;
+			}
+		}
+		//*cout << "queue " << buf << endl;
+		evt.push_back(q[buf]);
+		int prev_buf = buf;
+		pending.push({ start_nonce, buf });
+		buf = (buf + 1) % c_bufferCount;
+		start_nonce += m_globalWorkSize;
+
 		for (;; start_nonce += m_globalWorkSize)
 		{
 			// supply output buffer to kernel
 			m_searchKernel.setArg(0, m_searchBuffer[buf]);
 			m_searchKernel.setArg(3, start_nonce);
 
-			// execute it!
-			m_queue.enqueueNDRangeKernel(m_searchKernel, cl::NullRange, m_globalWorkSize, s_workgroupSize);
-
+			m_queue[buf].enqueueNDRangeKernel(m_searchKernel, cl::NullRange, m_globalWorkSize, s_workgroupSize, &evt, &q[buf]);
+			//cout << "queue " << buf << endl;
+			prev_buf = buf;
 			pending.push({ start_nonce, buf });
 			buf = (buf + 1) % c_bufferCount;
 
@@ -551,26 +600,29 @@ void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook
 			{
 				pending_batch const& batch = pending.front();
 
+				q[batch.buf].wait();
+				evt.clear(); evt.push_back(q[prev_buf]);
 				// could use pinned host pointer instead
-				uint32_t* results = (uint32_t*)m_queue.enqueueMapBuffer(m_searchBuffer[batch.buf], true, CL_MAP_READ, 0, (1 + c_maxSearchResults) * sizeof(uint32_t));
+				uint32_t* results = (uint32_t*)m_queue[batch.buf].enqueueMapBuffer(m_searchBuffer[batch.buf], true, CL_MAP_READ, 0, (1 + c_maxSearchResults) * sizeof(uint32_t));
 				unsigned num_found = min<unsigned>(results[0], c_maxSearchResults);
 
 				uint64_t nonces[c_maxSearchResults];
 				for (unsigned i = 0; i != num_found; ++i)
 					nonces[i] = batch.start_nonce + results[i + 1];
 
-				m_queue.enqueueUnmapMemObject(m_searchBuffer[batch.buf], results);
+				m_queue[batch.buf].enqueueUnmapMemObject(m_searchBuffer[batch.buf], results);
 				bool exit = num_found && hook.found(nonces, num_found);
 				exit |= hook.searched(batch.start_nonce, m_globalWorkSize); // always report searched before exit
 				if (exit)
 					break;
 
 				// reset search buffer if we're still going
-				if (num_found)
-					m_queue.enqueueWriteBuffer(m_searchBuffer[batch.buf], true, 0, 4, &c_zero);
-
+				if (num_found) {
+					m_queue[batch.buf].enqueueWriteBuffer(m_searchBuffer[batch.buf], CL_FALSE, 0, 4, &c_zero);
+				}
 				pending.pop();
 			}
+			
 		}
 
 		// not safe to return until this is ready

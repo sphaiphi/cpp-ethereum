@@ -19,7 +19,7 @@
 class ethash_cl_miner
 {
 private:
-	enum { c_maxSearchResults = 63, c_bufferCount = 2, c_hashBatchSize = 1024 };
+	enum { c_maxSearchResults = 63, c_bufferCount = 2, c_hashBatchSize = 1024, c_queue=2 };
 
 public:
 	struct search_hook
@@ -73,7 +73,7 @@ private:
 	static std::vector<cl::Platform> getPlatforms();
 
 	cl::Context m_context;
-	cl::CommandQueue m_queue;
+	cl::CommandQueue m_queue[c_queue];
 	cl::Kernel m_searchKernel;
 	cl::Kernel m_dagKernel;
 	cl::Buffer m_dag;
