@@ -321,8 +321,10 @@ void ethash_cl_miner::listDevices()
 
 void ethash_cl_miner::finish()
 {
-	if (m_queue())
-		m_queue.finish();
+	if (m_queue[0]())
+		m_queue[0].finish();
+	if (m_queue[1]())
+		m_queue[1].finish();
 }
 
 
@@ -395,7 +397,8 @@ bool ethash_cl_miner::init(
 		}
 		// create context
 		m_context = cl::Context(vector<cl::Device>(&device, &device + 1));
-		m_queue = cl::CommandQueue(m_context, device);
+		m_queue[0] = cl::CommandQueue(m_context, device);
+		m_queue[1] = cl::CommandQueue(m_context, device);
 
 		// make sure that global work size is evenly divisible by the local workgroup size
 		m_globalWorkSize = s_initialGlobalWorkSize;
@@ -446,7 +449,7 @@ bool ethash_cl_miner::init(
 			m_searchKernel = cl::Kernel(program, "ethash_search");
 			m_dagKernel = cl::Kernel(program, "ethash_calculate_dag_item");
 			ETHCL_LOG("Writing cache buffer");
-			m_queue.enqueueWriteBuffer(m_light, CL_TRUE, 0, _lightSize, _lightData);
+			m_queue[1].enqueueWriteBuffer(m_light, CL_TRUE, 0, _lightSize, _lightData);
 		}
 		catch (cl::Error const& err)
 		{
@@ -484,8 +487,8 @@ bool ethash_cl_miner::init(
 		for (uint32_t i = 0; i < fullRuns; i++)
 		{
 			m_dagKernel.setArg(0, i * m_globalWorkSize);
-			m_queue.enqueueNDRangeKernel(m_dagKernel, cl::NullRange, m_globalWorkSize, s_workgroupSize);
-			m_queue.finish();
+			m_queue[0].enqueueNDRangeKernel(m_dagKernel, cl::NullRange, m_globalWorkSize, s_workgroupSize);
+			m_queue[0].finish();
 			printf("OPENCL#%d: %.0f%%\n", _deviceId, 100.0f * (float)i / (float)fullRuns);
 		}
 
@@ -514,9 +517,9 @@ void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook
 		uint32_t const c_zero = 0;
 
 		// update header constant buffer
-		m_queue.enqueueWriteBuffer(m_header, false, 0, 32, header);
+		m_queue[1].enqueueWriteBuffer(m_header, false, 0, 32, header);
 		for (unsigned i = 0; i != c_bufferCount; ++i)
-			m_queue.enqueueWriteBuffer(m_searchBuffer[i], false, 0, 4, &c_zero);
+			m_queue[1].enqueueWriteBuffer(m_searchBuffer[i], false, 0, 4, &c_zero);
 
 #if CL_VERSION_1_2 && 0
 		cl::Event pre_return_event;
@@ -524,12 +527,14 @@ void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook
 			m_queue.enqueueBarrierWithWaitList(NULL, &pre_return_event);
 		else
 #endif
-			m_queue.finish();
+			m_queue[1].finish();
 
 		// pass these to stop the compiler unrolling the loops
 		m_searchKernel.setArg(4, target);
 		
 		unsigned buf = 0;
+		vector<cl::Event> empty, evt[2];
+		cl::Event cmplt;
 		random_device engine;
 		uint64_t start_nonce;
 		if (_ethStratum) start_nonce = _startN;
@@ -541,7 +546,8 @@ void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook
 			m_searchKernel.setArg(3, start_nonce);
 
 			// execute it!
-			m_queue.enqueueNDRangeKernel(m_searchKernel, cl::NullRange, m_globalWorkSize, s_workgroupSize);
+			m_queue[0].enqueueNDRangeKernel(m_searchKernel, cl::NullRange, m_globalWorkSize, s_workgroupSize, &empty, &cmplt);
+			evt[buf].push_back(cmplt);
 
 			pending.push({ start_nonce, buf });
 			buf = (buf + 1) % c_bufferCount;
@@ -552,14 +558,15 @@ void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook
 				pending_batch const& batch = pending.front();
 
 				// could use pinned host pointer instead
-				uint32_t* results = (uint32_t*)m_queue.enqueueMapBuffer(m_searchBuffer[batch.buf], true, CL_MAP_READ, 0, (1 + c_maxSearchResults) * sizeof(uint32_t));
+				uint32_t* results = (uint32_t*)m_queue[1].enqueueMapBuffer(m_searchBuffer[batch.buf], true, CL_MAP_READ, 0, (1 + c_maxSearchResults) * sizeof(uint32_t), &evt[batch.buf]);
+				evt[batch.buf].clear();
 				unsigned num_found = min<unsigned>(results[0], c_maxSearchResults);
 
 				uint64_t nonces[c_maxSearchResults];
 				for (unsigned i = 0; i != num_found; ++i)
 					nonces[i] = batch.start_nonce + results[i + 1];
 
-				m_queue.enqueueUnmapMemObject(m_searchBuffer[batch.buf], results);
+				m_queue[1].enqueueUnmapMemObject(m_searchBuffer[batch.buf], results);
 				bool exit = num_found && hook.found(nonces, num_found);
 				exit |= hook.searched(batch.start_nonce, m_globalWorkSize); // always report searched before exit
 				if (exit)
@@ -567,7 +574,7 @@ void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook
 
 				// reset search buffer if we're still going
 				if (num_found)
-					m_queue.enqueueWriteBuffer(m_searchBuffer[batch.buf], true, 0, 4, &c_zero);
+					m_queue[1].enqueueWriteBuffer(m_searchBuffer[batch.buf], CL_FALSE, 0, 4, &c_zero);
 
 				pending.pop();
 			}
