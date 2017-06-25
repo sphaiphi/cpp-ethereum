@@ -444,6 +444,9 @@ bool ethash_cl_miner::init(
 			m_dag = cl::Buffer(m_context, CL_MEM_READ_ONLY, dagSize);
 			ETHCL_LOG("Loading kernels");
 			m_searchKernel = cl::Kernel(program, "ethash_search");
+			m_searchStage1 = cl::Kernel(program, "ethash_search_stage1");
+			m_searchStage2 = cl::Kernel(program, "ethash_search_stage2");
+			m_searchStage3 = cl::Kernel(program, "ethash_search_stage3");
 			m_dagKernel = cl::Kernel(program, "ethash_calculate_dag_item");
 			ETHCL_LOG("Writing cache buffer");
 			m_queue.enqueueWriteBuffer(m_light, CL_TRUE, 0, _lightSize, _lightData);
@@ -526,8 +529,20 @@ void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook
 #endif
 			m_queue.finish();
 
-		// pass these to stop the compiler unrolling the loops
-		m_searchKernel.setArg(4, target);
+		ETHCL_LOG("Creating stage buffer");
+		cl::Buffer hash_share[c_bufferCount];
+		hash_share[0] = cl::Buffer(m_context, CL_MEM_READ_WRITE, 128 * m_globalWorkSize); 
+		hash_share[1] = cl::Buffer(m_context, CL_MEM_READ_WRITE, 128 * m_globalWorkSize);
+
+
+		m_searchStage1.setArg(1, m_header);
+		m_searchStage1.setArg(3, ~0u); // isolate
+
+		m_searchStage2.setArg(1, m_dag);
+		
+		m_searchStage3.setArg(2, target);
+		m_searchStage3.setArg(3, ~0u); // isolate
+		
 		
 		unsigned buf = 0;
 		random_device engine;
@@ -537,11 +552,18 @@ void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook
 		for (;; start_nonce += m_globalWorkSize)
 		{
 			// supply output buffer to kernel
-			m_searchKernel.setArg(0, m_searchBuffer[buf]);
-			m_searchKernel.setArg(3, start_nonce);
+			m_searchStage1.setArg(0, hash_share[buf]);
+			m_searchStage2.setArg(0, hash_share[buf]);
+			m_searchStage3.setArg(0, hash_share[buf]);
+
+			m_searchStage1.setArg(2, start_nonce);
+			m_searchStage3.setArg(1, m_searchBuffer[buf]);
+			
 
 			// execute it!
-			m_queue.enqueueNDRangeKernel(m_searchKernel, cl::NullRange, m_globalWorkSize, s_workgroupSize);
+			m_queue.enqueueNDRangeKernel(m_searchStage1, cl::NullRange, m_globalWorkSize, s_workgroupSize);
+			m_queue.enqueueNDRangeKernel(m_searchStage2, cl::NullRange, m_globalWorkSize, s_workgroupSize);
+			m_queue.enqueueNDRangeKernel(m_searchStage3, cl::NullRange, m_globalWorkSize, s_workgroupSize);
 
 			pending.push({ start_nonce, buf });
 			buf = (buf + 1) % c_bufferCount;

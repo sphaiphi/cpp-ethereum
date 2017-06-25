@@ -29,7 +29,9 @@
 #define ETHASH_DATASET_PARENTS 256
 #define NODE_WORDS (64/4)
 
-#define THREADS_PER_HASH (128 / 16)
+#define HASH_SIZE 128
+
+#define THREADS_PER_HASH (HASH_SIZE / 16)
 #define HASHES_PER_LOOP (GROUP_SIZE / THREADS_PER_HASH)
 #define FNV_PRIME	0x01000193
 
@@ -369,6 +371,131 @@ __kernel void ethash_search(
 		g_output[slot] = gid;
 	}
 }
+
+__kernel void ethash_search_stage1(
+	__global ulong* restrict g_share,
+	__constant hash32_t const* g_header,
+	ulong start_nonce,
+	uint isolate
+	)
+{
+	uint const gid = get_global_id(0);
+
+	// Compute one init hash per work item.
+
+	// sha3_512(header .. nonce)
+	ulong state[25];
+	copy(state, g_header->ulongs, 4);
+	state[4] = start_nonce + gid;
+
+	for (uint i = 6; i != 25; ++i)
+	{
+		state[i] = 0;
+	}
+	state[5] = 0x0000000000000001;
+	state[8] = 0x8000000000000000;
+
+	keccak_f1600_no_absorb((uint2*)state, 8, isolate);
+
+	copy(g_share + (NODE_WORDS*gid), state, 8);
+}
+
+#if PLATFORM != OPENCL_PLATFORM_NVIDIA // use maxrregs on nv
+__attribute__((reqd_work_group_size(GROUP_SIZE, 1, 1)))
+#endif
+__kernel void ethash_search_stage2(
+__global ulong* restrict g_share,
+__global hash128_t const* g_dag
+)
+{
+	__local compute_hash_share share[HASHES_PER_LOOP];
+
+	uint const gid = get_global_id(0);
+	// Move g_share to its memory address
+	g_share += NODE_WORDS*gid;
+
+	// Threads work together in this phase in groups of 8.
+	uint const thread_id = gid & 7;
+	uint const hash_id = (gid % GROUP_SIZE) >> 3;
+
+	for (int i = 0; i < THREADS_PER_HASH; i++)
+	{
+		// share init with other threads
+		if (i == thread_id)
+			copy(share[hash_id].ulongs, g_share, 8);
+
+		barrier(CLK_LOCAL_MEM_FENCE);
+
+		uint4 mix = share[hash_id].uint4s[thread_id & 3];
+		barrier(CLK_LOCAL_MEM_FENCE);
+
+		__local uint *share0 = share[hash_id].uints;
+
+		// share init0
+		if (thread_id == 0)
+			*share0 = mix.x;
+		barrier(CLK_LOCAL_MEM_FENCE);
+		uint init0 = *share0;
+
+		for (uint a = 0; a < ACCESSES; a += 4)
+		{
+			bool update_share = thread_id == ((a >> 2) & (THREADS_PER_HASH - 1));
+			//bool update_share = thread_id == amd_bfe(a, 2, THREADS_PER_HASH );
+
+			for (uint i = 0; i != 4; ++i)
+			{
+				if (update_share)
+				{
+					*share0 = fnv(init0 ^ (a + i), ((uint *)&mix)[i]) % DAG_SIZE;
+				}
+				barrier(CLK_LOCAL_MEM_FENCE);
+
+				mix = fnv4(mix, g_dag[*share0].uint4s[thread_id]);
+			}
+		}
+
+		share[hash_id].uints[thread_id] = fnv_reduce(mix);
+		barrier(CLK_LOCAL_MEM_FENCE);
+
+		if (i == thread_id)
+			copy(g_share + 8, share[hash_id].ulongs, 4);
+
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+}
+
+__kernel void ethash_search_stage3(
+	__global ulong* restrict g_share,
+	__global volatile uint* restrict g_output,
+	ulong target,
+	uint isolate
+	)
+{
+	ulong state[25];
+
+	uint const gid = get_global_id(0);
+
+	// Adjust memory address for its
+	copy(state, g_share + (NODE_WORDS * gid), 12);
+
+	for (uint i = 13; i != 25; ++i)
+	{
+		state[i] = 0;
+	}
+	state[12] = 0x0000000000000001;
+	state[16] = 0x8000000000000000;
+
+	// keccak_256(keccak_512(header..nonce) .. mix);
+	keccak_f1600_no_absorb((uint2*)state, 1, isolate);
+
+	if (as_ulong(as_uchar8(state[0]).s76543210) < target)
+	{
+		uint slot = min(convert_uint(MAX_OUTPUTS), convert_uint(atomic_inc(&g_output[0]) + 1));
+		g_output[slot] = gid;
+	}
+}
+
+
 
 static void SHA3_512(uint2* s, uint isolate)
 {
