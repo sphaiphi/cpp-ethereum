@@ -505,6 +505,7 @@ typedef struct
 {
 	uint64_t start_nonce;
 	unsigned buf;
+	uint32_t *results;
 } pending_batch;
 
 void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook& hook, bool _ethStratum, uint64_t _startN)
@@ -549,6 +550,9 @@ void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook
 		uint64_t start_nonce;
 		if (_ethStratum) start_nonce = _startN;
 		else start_nonce = uniform_int_distribution<uint64_t>()(engine);
+
+		cl::Event evt[2];
+
 		for (;; start_nonce += m_globalWorkSize)
 		{
 			// supply output buffer to kernel
@@ -565,7 +569,9 @@ void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook
 			m_queue.enqueueNDRangeKernel(m_searchStage2, cl::NullRange, m_globalWorkSize, s_workgroupSize);
 			m_queue.enqueueNDRangeKernel(m_searchStage3, cl::NullRange, m_globalWorkSize, s_workgroupSize);
 
-			pending.push({ start_nonce, buf });
+			uint32_t *results = (uint32_t*)m_queue.enqueueMapBuffer(m_searchBuffer[buf], CL_FALSE, CL_MAP_READ, 0, (1 + c_maxSearchResults) * sizeof(uint32_t), NULL, &evt[buf]);
+
+			pending.push({ start_nonce, buf, results});
 			buf = (buf + 1) % c_bufferCount;
 
 			// read results
@@ -574,12 +580,13 @@ void ethash_cl_miner::search(uint8_t const* header, uint64_t target, search_hook
 				pending_batch const& batch = pending.front();
 
 				// could use pinned host pointer instead
-				uint32_t* results = (uint32_t*)m_queue.enqueueMapBuffer(m_searchBuffer[batch.buf], true, CL_MAP_READ, 0, (1 + c_maxSearchResults) * sizeof(uint32_t));
-				unsigned num_found = min<unsigned>(results[0], c_maxSearchResults);
+				evt[batch.buf].wait();
+				//uint32_t* results = (uint32_t*)m_queue.enqueueMapBuffer(m_searchBuffer[batch.buf], true, CL_MAP_READ, 0, (1 + c_maxSearchResults) * sizeof(uint32_t));
+				unsigned num_found = min<unsigned>(batch.results[0], c_maxSearchResults);
 
 				uint64_t nonces[c_maxSearchResults];
 				for (unsigned i = 0; i != num_found; ++i)
-					nonces[i] = batch.start_nonce + results[i + 1];
+					nonces[i] = batch.start_nonce + batch.results[i + 1];
 
 				m_queue.enqueueUnmapMemObject(m_searchBuffer[batch.buf], results);
 				bool exit = num_found && hook.found(nonces, num_found);
