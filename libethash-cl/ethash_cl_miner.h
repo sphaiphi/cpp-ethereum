@@ -73,7 +73,7 @@ private:
 	static std::vector<cl::Platform> getPlatforms();
 
 	cl::Context m_context;
-	cl::CommandQueue m_queue;
+	cl::CommandQueue m_queue[c_bufferCount];
 	cl::Kernel m_searchKernel;
 	cl::Kernel m_searchStage1, m_searchStage2, m_searchStage3;
 	cl::Kernel m_dagKernel;
